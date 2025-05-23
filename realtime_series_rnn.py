@@ -1,792 +1,854 @@
+import os
 import numpy as np
+import pandas as pd
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout, Bidirectional, BatchNormalization
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
-from tensorflow.keras.optimizers import Adam
-import pandas as pd
-import matplotlib.pyplot as plt
-from sklearn.preprocessing import MinMaxScaler, StandardScaler, RobustScaler
+from tensorflow.keras.layers import Dense, LSTM, Dropout, GRU, Bidirectional
+from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
+from sklearn.preprocessing import MinMaxScaler
 from sklearn.model_selection import train_test_split
-import os
+from sklearn.metrics import mean_squared_error, r2_score
+import matplotlib.pyplot as plt
+import json
+import threading
+import time
+import logging
+import sys
 
-class RealtimeSeriesRNN:
-    def __init__(self, sequence_length=30, n_features=5, output_size=1, scaling_method='minmax', use_lr_schedule=False):
-        """Initialize RNN model with configuration parameters"""
-        self.sequence_length = sequence_length
-        self.n_features = n_features
-        self.output_size = output_size
-        self.scaling_method = scaling_method
-        self.use_lr_schedule = use_lr_schedule
-        self.history = None
-        self.model_dir = 'saved_models'
-        self.checkpoint_dir = os.path.join(self.model_dir, 'checkpoints')
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Flag to determine if Kafka is available
+KAFKA_AVAILABLE = False
+
+# Try to import Kafka libraries, but don't fail if they're not available
+try:
+    from confluent_kafka import Consumer, Producer
+    KAFKA_AVAILABLE = True
+except ImportError:
+    logger.warning("confluent_kafka package not available. Running in offline mode.")
+
+# Constants for file extensions based on TF version
+# TF 2.13+ uses .keras, older versions use .h5
+MODEL_FILE_EXT = '.keras' if tf.__version__ >= '2.13' else '.h5'
+
+class RealtimeDataAnalyzer:
+    def __init__(self, kafka_bootstrap_servers='localhost:9092', 
+                 kafka_topic='agro_iot_sensors', 
+                 data_path='E:\\Agrospere\\models\\datas\\RNN_realtime data',
+                 model_save_path='E:\\Agrospere\\models\\saved_models',
+                 offline_mode=not KAFKA_AVAILABLE):
+        """
+        Initialize the RNN model trainer for real-time agricultural data analysis.
         
-        # Create necessary directories
-        os.makedirs(self.model_dir, exist_ok=True)
-        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        Args:
+            kafka_bootstrap_servers: Kafka server address
+            kafka_topic: Topic to consume IoT sensor data from
+            data_path: Path to historical data for initial training
+            model_save_path: Path to save trained models
+            offline_mode: If True, don't try to connect to Kafka
+        """
+        self.kafka_bootstrap_servers = kafka_bootstrap_servers
+        self.kafka_topic = kafka_topic
+        self.data_path = data_path
+        self.model_save_path = model_save_path
+        self.offline_mode = offline_mode
         
-        # Initialize components
-        self._initialize_scaler()
-        self.model = self._build_model()
+        # Ensure directories exist
+        os.makedirs(self.model_save_path, exist_ok=True)
+        os.makedirs(self.data_path, exist_ok=True)
         
-    def _initialize_scaler(self):
-        """Initialize data scaler based on specified method"""
-        scalers = {
-            'minmax': MinMaxScaler(),
-            'standard': StandardScaler(),
-            'robust': RobustScaler()
+        # Initialize data containers
+        self.historical_data = None
+        self.streaming_data_buffer = []
+        self.scaler = MinMaxScaler(feature_range=(0, 1))
+        self.model = None
+        self.is_model_trained = False
+        self.sequence_length = 30  # Number of time steps to look back
+        
+        # Initialize lock for thread-safe operations
+        self.data_lock = threading.Lock()
+        
+        # Load historical data if available
+        self._load_historical_data()
+        
+        # If no historical data and in offline mode, create synthetic data
+        if self.historical_data is None and self.offline_mode:
+            logger.info("No historical data found. Creating synthetic data for testing.")
+            self._create_synthetic_data()
+    
+    def _load_historical_data(self):
+        """Load historical data from the specified path for initial model training."""
+        try:
+            # Assuming CSV format with columns: timestamp, temperature, humidity, rainfall, soil_moisture, etc.
+            data_files = [f for f in os.listdir(self.data_path) if f.endswith('.csv')]
+            
+            if not data_files:
+                logger.warning(f"No CSV files found in {self.data_path}. Will wait for streaming data or create synthetic data.")
+                return
+            
+            # Load and concatenate all data files
+            dfs = []
+            for file in data_files:
+                file_path = os.path.join(self.data_path, file)
+                df = pd.read_csv(file_path)
+                dfs.append(df)
+            
+            self.historical_data = pd.concat(dfs, ignore_index=True)
+            
+            # Ensure timestamp is in datetime format and sort by it
+            if 'timestamp' in self.historical_data.columns:
+                self.historical_data['timestamp'] = pd.to_datetime(self.historical_data['timestamp'])
+                self.historical_data.sort_values('timestamp', inplace=True)
+            
+            logger.info(f"Loaded historical data with {len(self.historical_data)} records")
+        except Exception as e:
+            logger.error(f"Error loading historical data: {e}")
+            self.historical_data = None
+    
+    def _create_synthetic_data(self):
+        """Create synthetic data for testing when no historical data is available."""
+        # Create a date range for the past year
+        end_date = pd.Timestamp.now()
+        start_date = end_date - pd.Timedelta(days=365)
+        dates = pd.date_range(start=start_date, end=end_date, freq='H')
+        
+        # Initialize DataFrame
+        data = {
+            'timestamp': dates,
+            'temperature': [],
+            'humidity': [],
+            'rainfall': [],
+            'soil_moisture': [],
+            'solar_radiation': [],
+            'wind_speed': [],
+            'yield': []
         }
-        self.scaler = scalers.get(self.scaling_method, MinMaxScaler())
         
-    def _build_model(self):
-        """Build and compile the RNN model"""
-        # Configure optimizer with gradient clipping
-        optimizer = Adam(
-            learning_rate=0.001,
-            clipnorm=1.0
-        )
+        # Generate synthetic data with seasonal patterns
+        for date in dates:
+            day_of_year = date.dayofyear
+            hour_of_day = date.hour
+            season_factor = np.sin(2 * np.pi * day_of_year / 365)
+            daily_factor = np.sin(2 * np.pi * hour_of_day / 24)
+            
+            # Generate sensor readings with patterns
+            temperature = 25 + 10 * season_factor + 5 * daily_factor + np.random.normal(0, 2)
+            humidity = 60 + 20 * season_factor - 10 * daily_factor + np.random.normal(0, 5)
+            rainfall = max(0, 5 * season_factor - 2 * daily_factor + np.random.exponential(1))
+            soil_moisture = 30 + 15 * season_factor + np.random.normal(0, 3)
+            solar_radiation = max(0, 800 + 400 * season_factor + 300 * daily_factor + np.random.normal(0, 50))
+            wind_speed = 5 + 2 * season_factor + 3 * daily_factor + np.random.exponential(2)
+            
+            # Calculate synthetic yield
+            base_yield = 100
+            temp_effect = -0.5 * (temperature - 25)**2 / 100
+            moisture_effect = -0.5 * (soil_moisture - 35)**2 / 100
+            rain_effect = 0.1 * rainfall if rainfall < 10 else (1 - 0.02 * (rainfall - 10))
+            
+            yield_estimate = base_yield * (1 + temp_effect + moisture_effect + rain_effect) / 3
+            
+            # Add to data dictionary
+            data['temperature'].append(temperature)
+            data['humidity'].append(humidity)
+            data['rainfall'].append(rainfall)
+            data['soil_moisture'].append(soil_moisture)
+            data['solar_radiation'].append(solar_radiation)
+            data['wind_speed'].append(wind_speed)
+            data['yield'].append(yield_estimate)
         
-        # Define model architecture
-        model = Sequential([
-            # Input layer
-            LSTM(128, return_sequences=True,
-                 kernel_regularizer=tf.keras.regularizers.l2(0.005),
-                 recurrent_regularizer=tf.keras.regularizers.l2(0.005),
-                 input_shape=(self.sequence_length, self.n_features)),
-            BatchNormalization(),
-            Dropout(0.3),
-            
-            # Hidden layers
-            LSTM(64, return_sequences=True),
-            BatchNormalization(),
-            Dropout(0.3),
-            
-            LSTM(32),
-            BatchNormalization(),
-            Dropout(0.2),
-            
-            # Output layers
-            Dense(16, activation='relu'),
-            BatchNormalization(),
-            Dense(self.output_size)
-        ])
+        # Create DataFrame
+        self.historical_data = pd.DataFrame(data)
         
-        # Compile model
-        model.compile(
-            optimizer=optimizer,
-            loss='huber',
-            metrics=['mae', 'mse']
-        )
+        # Save synthetic data
+        synthetic_data_path = os.path.join(self.data_path, 'synthetic_data.csv')
+        self.historical_data.to_csv(synthetic_data_path, index=False)
+        logger.info(f"Created synthetic dataset with {len(self.historical_data)} records and saved to {synthetic_data_path}")
+    
+    def preprocess_data(self, data, target_column='yield'):
+        """
+        Preprocess data for RNN model training.
+        
+        Args:
+            data: DataFrame containing the data
+            target_column: Column name for the target variable to predict
+            
+        Returns:
+            X_train, X_test, y_train, y_test, scaler
+        """
+        # Drop non-numeric columns except timestamp
+        numeric_data = data.select_dtypes(include=[np.number])
+        
+        # Check if target column exists, if not, try to create it or use another column
+        if target_column not in numeric_data.columns:
+            logger.warning(f"Target column '{target_column}' not found in data")
+            
+            # If we have temperature and soil_moisture, we can create a synthetic yield
+            if 'temperature' in numeric_data.columns and 'soil_moisture' in numeric_data.columns:
+                logger.info("Creating synthetic 'yield' column from existing data")
+                
+                # Create a synthetic yield based on temperature and soil_moisture
+                temp = numeric_data['temperature']
+                moisture = numeric_data['soil_moisture'] if 'soil_moisture' in numeric_data.columns else numeric_data['humidity']
+                
+                # Simple formula: yield is optimal at 25°C and 35% soil moisture
+                temp_effect = -0.5 * (temp - 25)**2 / 100
+                moisture_effect = -0.5 * (moisture - 35)**2 / 100
+                
+                base_yield = 100
+                numeric_data[target_column] = base_yield * (1 + temp_effect + moisture_effect) / 2
+            else:
+                # If we can't create yield, use the first column as target
+                logger.warning(f"Using '{numeric_data.columns[0]}' as target instead")
+                target_column = numeric_data.columns[0]
+        
+        # Scale the data
+        scaled_data = self.scaler.fit_transform(numeric_data)
+        scaled_df = pd.DataFrame(scaled_data, columns=numeric_data.columns)
+        
+        # Create sequences for time series prediction
+        X, y = [], []
+        for i in range(len(scaled_df) - self.sequence_length):
+            X.append(scaled_df.drop(columns=[target_column]).iloc[i:i+self.sequence_length].values)
+            y.append(scaled_df[target_column].iloc[i+self.sequence_length])
+        
+        X, y = np.array(X), np.array(y)
+        
+        # Split the data
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        
+        return X_train, X_test, y_train, y_test
+    
+    def build_model(self, input_shape):
+        """
+        Build and compile the RNN model.
+        
+        Args:
+            input_shape: Shape of input data (sequence_length, features)
+            
+        Returns:
+            Compiled Keras model
+        """
+        model = Sequential()
+        
+        # Bidirectional LSTM layer
+        model.add(Bidirectional(LSTM(units=128, return_sequences=True), input_shape=input_shape))
+        model.add(Dropout(0.2))
+        
+        # Second LSTM layer
+        model.add(LSTM(units=64, return_sequences=False))
+        model.add(Dropout(0.2))
+        
+        # Dense layers
+        model.add(Dense(units=32, activation='relu'))
+        model.add(Dense(units=1))  # Output layer
+        
+        # Compile the model
+        model.compile(optimizer='adam', loss='mean_squared_error')
         
         return model
-
-    def preprocess_data(self, data, target_column=None):
-        """Enhanced data preprocessing with validation"""
-        # Input validation
-        if not isinstance(data, (pd.DataFrame, np.ndarray)):
-            raise ValueError("Data must be pandas DataFrame or numpy array")
+    
+    def get_model_filepath(self, filename_base):
+        """
+        Generate a model filepath with the correct extension based on TF version.
+        
+        Args:
+            filename_base: Base filename without extension
             
-        # Handle missing values
-        if isinstance(data, pd.DataFrame):
-            data = data.interpolate(method='linear').fillna(method='bfill').fillna(method='ffill')
+        Returns:
+            Full filepath with appropriate extension
+        """
+        return os.path.join(self.model_save_path, f"{filename_base}{MODEL_FILE_EXT}")
+    
+    def train_model(self, data=None, target_column='yield', epochs=100, batch_size=32):
+        """
+        Train the RNN model on the provided data.
         
-        # Extract features and target
-        X, y = self._extract_features_target(data, target_column)
+        Args:
+            data: DataFrame to use for training (uses historical_data if None)
+            target_column: Column to predict
+            epochs: Number of training epochs
+            batch_size: Batch size for training
+            
+        Returns:
+            Training history
+        """
+        if data is None:
+            if self.historical_data is None or len(self.historical_data) < self.sequence_length + 1:
+                logger.warning("Insufficient data for training. Need more data points.")
+                return None
+            data = self.historical_data
         
-        # Scale features
-        X_scaled = self.scaler.fit_transform(X)
+        # Check data columns
+        logger.info(f"Available columns in data: {data.columns.tolist()}")
         
-        # Create sequences
-        return self._create_sequences(X_scaled, y)
-
-    def _extract_features_target(self, data, target_column):
-        if isinstance(data, pd.DataFrame):
-            if target_column:
-                y = data[target_column].values
-                X = data.drop(columns=[target_column]).values
-            else:
-                X = data.values
-                y = None
-        else:
-            X = data
-            y = None
-        return X, y
-
-    def _create_sequences(self, X_scaled, y=None):
-        seq_length = min(self.sequence_length, X_scaled.shape[0] - 1)
-        X_sequences = []
-        y_targets = []
-        
-        for i in range(len(X_scaled) - seq_length):
-            sequence = X_scaled[i:i+seq_length]
-            X_sequences.append(sequence)
-            if y is not None:
-                y_targets.append(y[i+seq_length])
-        
-        X_sequences = np.array(X_sequences)
-        return (X_sequences, np.array(y_targets)) if y is not None else X_sequences
-
-    def train(self, data, target_column, epochs=100, batch_size=32, validation_split=0.2):
-        """Train the model with the provided data"""
+        # Preprocess the data
         try:
-            # Preprocess and split data
-            X_sequences, y_targets = self.preprocess_data(data, target_column)
-            X_train, X_val, y_train, y_val = train_test_split(
-                X_sequences, y_targets, 
-                test_size=validation_split, 
-                shuffle=False
-            )
-            
-            # Augment training data
-            X_train_aug, y_train_aug = self._augment_data(X_train, y_train)
-            
-            # Train model
-            self.history = self.model.fit(
-                X_train_aug, y_train_aug,
-                epochs=epochs,
-                batch_size=batch_size,
-                validation_data=(X_val, y_val),
-                callbacks=self._get_callbacks(),
-                verbose=1
-            )
-            
-            return self.history
-            
+            X_train, X_test, y_train, y_test = self.preprocess_data(data, target_column)
         except Exception as e:
-            print(f"Training error: {str(e)}")
-            raise
-
-    def _augment_data(self, X, y):
-        """Enhanced data augmentation"""
-        augmented_X = []
-        augmented_y = []
+            logger.error(f"Error preprocessing data: {e}")
+            return None
         
-        for i in range(len(X)):
-            # Original sequence
-            augmented_X.append(X[i])
-            augmented_y.append(y[i])
-            
-            # Add noise
-            noise = np.random.normal(0, 0.01, X[i].shape)
-            augmented_X.append(X[i] + noise)
-            augmented_y.append(y[i])
-            
-            # Scale variation
-            scale_factor = np.random.uniform(0.95, 1.05)
-            augmented_X.append(X[i] * scale_factor)
-            augmented_y.append(y[i])
+        # Build the model
+        input_shape = (X_train.shape[1], X_train.shape[2])
+        self.model = self.build_model(input_shape)
         
-        return np.array(augmented_X), np.array(augmented_y)
-
-    def _get_callbacks(self):
-        """Configure training callbacks"""
-        checkpoint_path = os.path.join(self.checkpoint_dir, 'best_model.keras')
-        
-        return [
-            EarlyStopping(
-                monitor='val_loss',
-                patience=20,
-                restore_best_weights=True,
-                min_delta=1e-4
-            ),
-            ModelCheckpoint(
-                filepath=checkpoint_path,
-                save_best_only=True,
-                monitor='val_loss'
-            ),
-            ReduceLROnPlateau(
-                monitor='val_loss',
-                factor=0.2,
-                patience=10,
-                min_lr=1e-6
-            )
-        ]
-
-    def _plot_training_history(self, history):
-        """Plot training and validation loss"""
-        plt.figure(figsize=(12, 6))
-        
-        # Plot loss
-        plt.subplot(1, 2, 1)
-        plt.plot(history.history['loss'], label='Training Loss')
-        plt.plot(history.history['val_loss'], label='Validation Loss')
-        plt.title('Model Loss')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.legend()
-        
-        # Plot MAE
-        plt.subplot(1, 2, 2)
-        plt.plot(history.history['mae'], label='Training MAE')
-        plt.plot(history.history['val_mae'], label='Validation MAE')
-        plt.title('Model MAE')
-        plt.xlabel('Epoch')
-        plt.ylabel('MAE')
-        plt.legend()
-        
-        plt.tight_layout()
-        plt.savefig('training_history.png')
-        plt.show()
-    
-    def predict(self, data):
-        """Generate predictions for input data"""
-        try:
-            X_sequences = self.preprocess_data(data)
-            return self.model.predict(X_sequences)
-        except Exception as e:
-            print(f"Prediction error: {str(e)}")
-            raise
-    
-    def predict_next_n_steps(self, initial_sequence, n_steps=10):
-        """Predict next n steps using recursive forecasting"""
-        if not isinstance(initial_sequence, np.ndarray):
-            initial_sequence = np.array(initial_sequence)
-            
-        if initial_sequence.shape[0] < self.sequence_length:
-            raise ValueError(f"Initial sequence must have at least {self.sequence_length} time steps")
-        
-        # Scale the initial sequence
-        scaled_sequence = self.scaler.transform(initial_sequence)
-        
-        # Initialize the forecast array
-        forecasts = []
-        
-        # Get the most recent sequence
-        current_sequence = scaled_sequence[-self.sequence_length:].reshape(1, self.sequence_length, self.n_features)
-        
-        # Predict n steps ahead
-        for _ in range(n_steps):
-            # Predict the next step
-            next_step = self.model.predict(current_sequence)[0]
-            forecasts.append(next_step)
-            
-            # Update the sequence for the next prediction
-            # Create a new row with the predicted value and zeros for other features
-            new_row = np.zeros((1, self.n_features))
-            new_row[0, 0] = next_step  # Assuming the target is the first feature
-            
-            # Remove the oldest time step and add the new prediction
-            current_sequence = np.append(current_sequence[:, 1:, :], 
-                                        [new_row], 
-                                        axis=1)
-        
-        return np.array(forecasts)
-    
-    def save_model(self, filepath):
-        """Save the trained model to disk"""
-        try:
-            # Create directory if it doesn't exist
-            os.makedirs(os.path.dirname(filepath), exist_ok=True)
-            
-            # Save the model
-            self.model.save(filepath)
-            
-            # Save scaler configuration
-            scaler_path = f"{os.path.splitext(filepath)[0]}_scaler.pkl"
-            import pickle
-            with open(scaler_path, 'wb') as f:
-                pickle.dump(self.scaler, f)
-                
-            print(f"Model saved to {filepath}")
-            print(f"Scaler saved to {scaler_path}")
-            return True
-        except Exception as e:
-            print(f"Error saving model: {str(e)}")
-            return False
-    
-    def load_model(self, filepath):
-        """Load model and scaler from disk"""
-        self.model = tf.keras.models.load_model(filepath)
-        scaler_path = f"{os.path.splitext(filepath)[0]}_scaler.pkl"
-        if os.path.exists(scaler_path):
-            with open(scaler_path, 'rb') as f:
-                self.scaler = pickle.load(f)
-        print(f"Model loaded from {filepath}")
-
-    def evaluate(self, test_data, target_column):
-        """Enhanced evaluation with correct return values"""
-        try:
-            # Preprocess test data
-            X_test, y_test = self.preprocess_data(test_data, target_column)
-            
-            # Get model metrics
-            metrics = self.model.evaluate(X_test, y_test, verbose=1)
-            loss, mae, mse = metrics  # Unpack the three metrics
-            
-            # Generate predictions
-            predictions = self.model.predict(X_test)
-            
-            # Calculate additional metrics
-            rmse = np.sqrt(mse)
-            
-            # Import r2_score if not already imported
-            from sklearn.metrics import r2_score
-            r2 = r2_score(y_test, predictions)
-            
-            # Plot results
-            self._plot_evaluation_metrics(y_test, predictions.flatten(), loss, mae, rmse, r2)
-            
-            # Return exactly three values as expected
-            return loss, mae, predictions.flatten()
-            
-        except Exception as e:
-            print(f"Evaluation error: {str(e)}")
-            # Return empty arrays instead of None
-            return 0.0, 0.0, np.array([])
-
-    def _plot_evaluation_metrics(self, y_true, y_pred, loss, mae, rmse, r2):
-        """Plot evaluation results with enhanced visualization"""
-        plt.figure(figsize=(15, 10))
-        
-        # Time series plot
-        plt.subplot(2, 1, 1)
-        plt.plot(y_true, 'b-', label='Actual', linewidth=2)
-        plt.plot(y_pred, 'r--', label='Predicted', linewidth=2)
-        plt.title(f'Prediction Results\nLoss: {loss:.4f}, MAE: {mae:.4f}, RMSE: {rmse:.4f}')
-        plt.legend()
-        plt.grid(True)
-        
-        # Correlation plot
-        plt.subplot(2, 1, 2)
-        plt.scatter(y_true, y_pred, alpha=0.5)
-        plt.plot([min(y_true), max(y_true)], [min(y_true), max(y_true)], 'r--')
-        plt.title(f'Prediction Correlation (R² = {r2:.4f})')
-        plt.xlabel('Actual Values')
-        plt.ylabel('Predicted Values')
-        plt.grid(True)
-        
-        plt.tight_layout()
-        plt.savefig('evaluation_results.png')
-        plt.close()
-
-
-
-
-
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import os
-import requests
-import zipfile
-import io
-from sklearn.preprocessing import MinMaxScaler
-
-# Create directories if they don't exist
-os.makedirs('saved_models', exist_ok=True)
-os.makedirs('data', exist_ok=True)
-os.makedirs('saved_models/checkpoints', exist_ok=True)
-
-def download_datasets():
-    """Download agricultural datasets from Kaggle or direct sources"""
-    print("Downloading agricultural datasets...")
-    
-    try:
-        # Try using Kaggle API
-        import kaggle
-        
-        # Define datasets to download
-        kaggle_datasets = [
-            ('anshtanwar/current-daily-price-of-various-commodities-india', 'data/commodities'),
-            ('saeedahmadi/agricultural-commodities-dataset', 'data/commodities_backup'),
-            ('vipullrathod/daily-min-temperatures', 'data/weather/temperatures'),
-            ('sumanthvrao/daily-climate-time-series-data', 'data/weather/climate'),
-            ('patelris/yield-prediction', 'data/farm_yield'),
-            ('manish1809/mtpproject', 'data/soil/improved'),
-            ('cdminix/us-drought-meteorological-data', 'data/soil/drought'),
-            ('atharvaingle/crop-recommendation-dataset', 'data/practices')
-        ]
-        
-        # Download each dataset
-        for dataset, path in kaggle_datasets:
-            print(f"Downloading {dataset}...")
-            kaggle.api.dataset_download_files(dataset, path=path, unzip=True)
-            
-        print("All datasets downloaded successfully using Kaggle API.")
-        
-    except Exception as e:
-        print(f"Error using Kaggle API: {e}")
-        print("Downloading datasets directly using requests instead...")
-        
-        # Direct download URLs for the datasets
-        datasets = {
-            'commodities': 'https://raw.githubusercontent.com/datasets/agriculture/master/data/crop-production.csv',
-            'weather': 'https://raw.githubusercontent.com/jbrownlee/Datasets/master/daily-min-temperatures.csv',
-            'farm_yield': 'https://raw.githubusercontent.com/rishabh-patel/farm-yield-prediction/main/yield_df.csv',
-            'practices': 'https://raw.githubusercontent.com/datasets/fertilizer/master/data/Fertilizer.csv'
-        }
-        
-        # Download each dataset
-        for dataset_name, url in datasets.items():
-            try:
-                print(f"Downloading {dataset_name} dataset...")
-                os.makedirs(f'data/{dataset_name}', exist_ok=True)
-                
-                response = requests.get(url)
-                response.raise_for_status()
-                
-                with open(f'data/{dataset_name}/{dataset_name}.csv', 'wb') as f:
-                    f.write(response.content)
-                
-                print(f"{dataset_name} dataset downloaded successfully.")
-                
-            except Exception as e:
-                print(f"Error downloading {dataset_name} dataset: {e}")
-        
-        print("\nIf you want to use the Kaggle API in the future:")
-        print("1. Install the Kaggle package: pip install kaggle")
-        print("2. Go to https://www.kaggle.com/account")
-        print("3. Click 'Create New API Token' to download kaggle.json")
-        print("4. Place this file in ~/.kaggle/ or C:\\Users\\<username>\\.kaggle\\")
-
-def load_and_prepare_data():
-    """Load and prepare agricultural datasets for time series analysis"""
-    print("\nLoading and preparing agricultural time series data...")
-    
-    # Create required directories
-    for dir_path in ['data/commodities', 'data/weather', 'data/farm_yield', 'data/soil']:
-        os.makedirs(dir_path, exist_ok=True)
-    
-    # Try to load the farm yield dataset first (integrated data)
-    farm_yield_paths = [
-        'data/farm_yield/yield_df.csv',
-        'data/farm_yield/yield_prediction.csv',
-        'data/yield_df.csv',
-    ]
-    
-    # Try loading farm yield dataset
-    for path in farm_yield_paths:
-        if os.path.exists(path):
-            try:
-                farm_yield_df = pd.read_csv(path)
-                print(f"Loaded integrated farm yield data from {path}")
-                
-                # Check if dataset has expected structure
-                if 'Year' in farm_yield_df.columns and 'hg/ha_yield' in farm_yield_df.columns:
-                    print("Using integrated farm yield dataset")
-                    
-                    # Sort by year
-                    farm_yield_df = farm_yield_df.sort_values('Year')
-                    
-                    # Create dummy variables for categorical columns
-                    cat_columns = [col for col in farm_yield_df.columns 
-                                  if farm_yield_df[col].dtype == 'object' and col not in ['Year']]
-                    
-                    if cat_columns:
-                        farm_yield_df = pd.get_dummies(farm_yield_df, columns=cat_columns)
-                    
-                    # Create the final dataset
-                    feature_cols = [col for col in farm_yield_df.columns 
-                                   if col not in ['Year', 'hg/ha_yield'] 
-                                   and not pd.api.types.is_string_dtype(farm_yield_df[col])]
-                    
-                    time_series_data = farm_yield_df[feature_cols + ['hg/ha_yield']].copy()
-                    years = farm_yield_df['Year'].values
-                    
-                    print(f"Prepared time series data: {time_series_data.shape} with {len(feature_cols)} features")
-                    return time_series_data, years
-            except Exception as e:
-                print(f"Error processing {path}: {e}")
-    
-    print("Integrated dataset not found or invalid, merging separate datasets...")
-    
-    # Load crop data
-    crop_df = load_dataset([
-        'data/commodities/Daily_Price_of_Various_Commodities.csv',
-        'data/commodities/daily_price.csv',
-        'data/commodities_backup/yield_df.csv',
-        'data/commodities/crop-production.csv'
-    ], "crop")
-    
-    # Load weather data
-    weather_df = load_dataset([
-        'data/weather/temperatures/daily-min-temperatures.csv',
-        'data/weather/climate/DailyDelhiClimateTrain.csv',
-        'data/weather/daily-min-temperatures.csv'
-    ], "weather")
-    
-    # Load soil data
-    soil_df = load_dataset([
-        'data/soil/improved/soil_data.csv',
-        'data/soil/drought/drought.csv',
-        'data/soil/soil-carbon.csv'
-    ], "soil")
-    
-    # Process and merge datasets
-    crop_data = process_crop_data(crop_df)
-    yearly_weather = process_weather_data(weather_df)
-    yearly_soil = process_soil_data(soil_df)
-    
-    # Merge datasets
-    merged_data = merge_datasets(crop_data, yearly_weather, yearly_soil)
-    
-    # Create final dataset
-    feature_cols = [col for col in merged_data.columns 
-                   if col not in ['Year', 'hg/ha_yield', 'Area', 'Item'] 
-                   and not pd.api.types.is_string_dtype(merged_data[col])]
-    
-    time_series_data = merged_data[feature_cols + ['hg/ha_yield']].copy()
-    years = merged_data['Year'].values if 'Year' in merged_data.columns else np.arange(len(merged_data))
-    
-    print(f"Prepared time series data: {time_series_data.shape} with {len(feature_cols)} features")
-    return time_series_data, years
-
-def load_dataset(paths, dataset_type):
-    """Load a dataset from multiple possible paths"""
-    for path in paths:
-        if os.path.exists(path):
-            try:
-                df = pd.read_csv(path)
-                print(f"Loaded {dataset_type} data from {path}")
-                return df
-            except Exception as e:
-                print(f"Error loading {path}: {e}")
-    
-    print(f"No {dataset_type} data found. Please run download_datasets() first.")
-    return pd.DataFrame()  # Return empty DataFrame if no data found
-
-def process_crop_data(crop_df):
-    """Process crop yield data"""
-    if crop_df.empty:
-        return pd.DataFrame({'Year': [], 'hg/ha_yield': []})
-    
-    # Process based on dataset structure
-    if 'Date' in crop_df.columns and 'Price' in crop_df.columns:
-        # Indian commodities dataset
-        crop_df['Date'] = pd.to_datetime(crop_df['Date'])
-        crop_df['Year'] = crop_df['Date'].dt.year
-        
-        if 'Commodity' in crop_df.columns:
-            main_commodity = crop_df['Commodity'].value_counts().index[0]
-            crop_data = crop_df[crop_df['Commodity'] == main_commodity]
-            crop_data = crop_data.groupby('Year').agg({'Price': 'mean'}).reset_index()
-            crop_data.rename(columns={'Price': 'hg/ha_yield'}, inplace=True)
-        else:
-            crop_data = crop_df.groupby('Year').agg({'Price': 'mean'}).reset_index()
-            crop_data.rename(columns={'Price': 'hg/ha_yield'}, inplace=True)
-    else:
-        # Try to find year and yield columns
-        year_cols = [col for col in crop_df.columns if 'year' in col.lower()]
-        yield_cols = [col for col in crop_df.columns if 'yield' in col.lower() or 'production' in col.lower()]
-        
-        if year_cols and yield_cols:
-            crop_data = crop_df[[year_cols[0], yield_cols[0]]].copy()
-            crop_data.columns = ['Year', 'hg/ha_yield']
-        else:
-            # Create synthetic data if needed
-            crop_data = pd.DataFrame({
-                'Year': np.arange(2000, 2020),
-                'hg/ha_yield': np.random.normal(5000, 500, 20)
-            })
-    
-    return crop_data
-
-def process_weather_data(weather_df):
-    """Process weather data"""
-    if weather_df.empty:
-        return pd.DataFrame({'year': []})
-    
-    # Convert date column to datetime
-    date_cols = [col for col in weather_df.columns if 'date' in col.lower() or 'time' in col.lower()]
-    
-    if date_cols:
-        date_col = date_cols[0]
-        weather_df[date_col] = pd.to_datetime(weather_df[date_col], errors='coerce')
-        weather_df['year'] = weather_df[date_col].dt.year
-        
-        # Aggregate numeric columns by year
-        num_cols = weather_df.select_dtypes(include=['number']).columns
-        agg_cols = [col for col in num_cols if col != 'year']
-        
-        yearly_weather = weather_df.groupby('year').agg({
-            col: 'mean' for col in agg_cols
-        }).reset_index()
-    else:
-        # Create synthetic data if needed
-        yearly_weather = pd.DataFrame({
-            'year': np.arange(2000, 2020),
-            'temperature': np.random.normal(25, 5, 20),
-            'humidity': np.random.normal(60, 10, 20)
-        })
-    
-    return yearly_weather
-
-def process_soil_data(soil_df):
-    """Process soil data"""
-    if soil_df.empty:
-        return pd.DataFrame({'year': []})
-    
-    # Look for date columns
-    date_cols = [col for col in soil_df.columns if 'date' in col.lower() or 'time' in col.lower() or 'year' in col.lower()]
-    
-    if date_cols:
-        date_col = date_cols[0]
-        if 'year' not in date_col.lower():
-            soil_df[date_col] = pd.to_datetime(soil_df[date_col], errors='coerce')
-            soil_df['year'] = soil_df[date_col].dt.year
-        else:
-            soil_df['year'] = soil_df[date_col]
-        
-        # Aggregate numeric columns by year
-        num_cols = soil_df.select_dtypes(include=['number']).columns
-        soil_features = [col for col in num_cols if col != 'year' and 'id' not in col.lower()]
-        
-        yearly_soil = soil_df.groupby('year').agg({
-            col: 'mean' for col in soil_features
-        }).reset_index()
-    else:
-        # Create synthetic data if needed
-        yearly_soil = pd.DataFrame({
-            'year': np.arange(2000, 2020),
-            'moisture': np.random.normal(30, 5, 20),
-            'ph': np.random.normal(6.5, 0.5, 20)
-        })
-    
-    return yearly_soil
-
-def merge_datasets(crop_data, weather_data, soil_data):
-    """Merge crop, weather and soil datasets"""
-    merged_data = crop_data.copy()
-    
-    # Merge with weather data if available
-    if not weather_data.empty:
-        common_years = set(weather_data['year']).intersection(set(merged_data['Year']))
-        if common_years:
-            merged_data = pd.merge(
-                merged_data, 
-                weather_data,
-                left_on='Year',
-                right_on='year',
-                how='left'
-            ).drop(columns=['year'])
-        else:
-            print("Warning: No overlapping years between crop and weather data")
-    
-    # Merge with soil data if available
-    if not soil_data.empty:
-        common_years = set(soil_data['year']).intersection(set(merged_data['Year']))
-        if common_years:
-            merged_data = pd.merge(
-                merged_data, 
-                soil_data,
-                left_on='Year',
-                right_on='year',
-                how='left'
-            ).drop(columns=['year'])
-        else:
-            print("Warning: No overlapping years between crop and soil data")
-    
-    # Fill missing values
-    merged_data = merged_data.fillna(method='ffill').fillna(method='bfill')
-    
-    return merged_data
-
-def main():
-    # Check if datasets exist, if not download them
-    if not all(os.path.exists(f'data/{dir}') for dir in ['commodities', 'weather', 'farm_yield']):
-        download_datasets()
-    
-    # Load and prepare the data
-    data, years = load_and_prepare_data()
-    
-    # Plot the data
-    plt.figure(figsize=(15, 10))
-    plot_cols = [col for col in data.columns if col != 'hg/ha_yield' 
-                and not col.startswith('Area_') and not col.startswith('Item_')]
-    
-    for i, column in enumerate(plot_cols[:5]):  # Plot up to 5 features
-        plt.subplot(3, 2, i+1)
-        plt.plot(years, data[column])
-        plt.title(column)
-    
-    # Plot the target variable
-    plt.subplot(3, 2, 6)
-    plt.plot(years, data['hg/ha_yield'], 'r-')
-    plt.title('Crop Yield (hg/ha)')
-    
-    plt.tight_layout()
-    plt.savefig('data_visualization.png')
-    
-    # Split into train and test with 90:10 ratio
-    train_size = int(len(data) * 0.9)
-    train_data = data[:train_size]
-    test_data = data[train_size-5:]  # Include overlap for sequence
-    
-    print(f"\nTraining data shape: {train_data.shape}")
-    print(f"Testing data shape: {test_data.shape}")
-    
-    # Initialize and train the model
-    print("\nInitializing RNN model...")
-    model = RealtimeSeriesRNN(
-        sequence_length=5,  # Shorter sequence due to limited data points
-        n_features=len(data.columns) - 1,  # Excluding the target column
-        output_size=1,
-        scaling_method='standard',  # Use standard scaling
-        use_lr_schedule=False  # Use fixed learning rate with ReduceLROnPlateau
-    )
-    
-    print("\nTraining the model...")
-    try:
-        history = model.train(
-            data=train_data,
-            target_column='hg/ha_yield',
-            epochs=100,
-            batch_size=4,  # Smaller batch size for smaller dataset
-            validation_split=0.2
+        # Define callbacks
+        checkpoint = ModelCheckpoint(
+            self.get_model_filepath('best_model'),  # Using helper method for correct extension
+            monitor='val_loss',
+            save_best_only=True,
+            mode='min',
+            verbose=1
         )
         
-        # Evaluate on test data
-        print("\nEvaluating the model on test data...")
-        loss, mae, predictions = model.evaluate(test_data, 'hg/ha_yield')
-
-        # Save the model
-        model.save_model('saved_models/crop_yield_rnn.keras')
-
-        # Demonstrate forecasting
-        print("\nDemonstrating multi-step forecasting...")
-        # Use the last available sequence for forecasting
-        last_sequence = test_data.iloc[-10:].drop(columns=['hg/ha_yield'])
-        forecast = model.predict_next_n_steps(last_sequence.values, n_steps=5)
-
-        # Plot forecast
-        plt.figure(figsize=(12, 6))
-        # Plot actual values
-        plt.plot(years[-len(test_data):], test_data['hg/ha_yield'].values, label='Actual')
-
-        # Plot predicted values (align with actual data points)
-        if len(predictions) > 0:  # Check if predictions is not empty
-            pred_years = years[-len(predictions):]
-            plt.plot(pred_years, predictions, label='Predicted')
-
-            # Plot forecast (future years)
-            forecast_years = np.arange(years[-1] + 1, years[-1] + 6)
-            plt.plot(forecast_years, forecast, label='Forecast', linestyle='--')
-
-            plt.axvline(x=years[-1], color='r', linestyle='-')
-            plt.title('Crop Yield Prediction and Forecast')
-            plt.xlabel('Year')
-            plt.ylabel('Yield (hg/ha)')
-            plt.legend()
-            plt.savefig('forecast_results.png')
-            plt.show()
-        else:
-            print("Warning: No predictions available for plotting")
-
-        print("\nTraining and evaluation complete. Model saved to 'saved_models/crop_yield_rnn.keras'")
+        early_stopping = EarlyStopping(
+            monitor='val_loss',
+            patience=10,
+            restore_best_weights=True,
+            verbose=1
+        )
         
-    except Exception as e:
-        print(f"Error during training or evaluation: {e}")
-        import traceback
-        traceback.print_exc()
+        reduce_lr = ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.2,
+            patience=5,
+            min_lr=0.0001,
+            verbose=1
+        )
+        
+        # Train the model
+        history = self.model.fit(
+            X_train, y_train,
+            epochs=epochs,
+            batch_size=batch_size,
+            validation_data=(X_test, y_test),
+            callbacks=[checkpoint, early_stopping, reduce_lr],
+            verbose=1
+        )
+        
+        # Evaluate the model
+        y_pred = self.model.predict(X_test)
+        mse = mean_squared_error(y_test, y_pred)
+        r2 = r2_score(y_test, y_pred)
+        
+        logger.info(f"Model training completed. MSE: {mse}, R²: {r2}")
+        
+        # Save the final model
+        self.model.save(self.get_model_filepath('final_model'))
+        
+        # Plot training history
+        self._plot_training_history(history)
+        
+        # Plot predictions vs actual
+        self._plot_predictions(y_test, y_pred)
+        
+        self.is_model_trained = True
+        return history
+    
+    def _plot_training_history(self, history):
+        """Plot and save the training history."""
+        plt.figure(figsize=(12, 6))
+        plt.plot(history.history['loss'], label='Training Loss')
+        plt.plot(history.history['val_loss'], label='Validation Loss')
+        plt.title('Model Training History')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss (MSE)')
+        plt.legend()
+        plt.grid(True)
+        
+        # Save the plot
+        plot_path = os.path.join(self.model_save_path, 'training_history.png')
+        plt.savefig(plot_path)
+        plt.close()
+        logger.info(f"Training history plot saved to {plot_path}")
+    
+    def _plot_predictions(self, y_true, y_pred):
+        """Plot and save actual vs predicted values."""
+        plt.figure(figsize=(12, 6))
+        plt.scatter(y_true, y_pred, alpha=0.5)
+        
+        # Add perfect prediction line
+        min_val = min(np.min(y_true), np.min(y_pred))
+        max_val = max(np.max(y_true), np.max(y_pred))
+        plt.plot([min_val, max_val], [min_val, max_val], 'r--')
+        
+        plt.title('Actual vs Predicted Values')
+        plt.xlabel('Actual')
+        plt.ylabel('Predicted')
+        plt.grid(True)
+        
+        # Save the plot
+        plot_path = os.path.join(self.model_save_path, 'prediction_scatter.png')
+        plt.savefig(plot_path)
+        plt.close()
+        logger.info(f"Prediction scatter plot saved to {plot_path}")
+    
+    def start_kafka_consumer(self):
+        """Start a separate thread to consume data from Kafka."""
+        if self.offline_mode:
+            logger.info("Running in offline mode. Kafka consumer not started.")
+            return
+        
+        if not KAFKA_AVAILABLE:
+            logger.error("Kafka libraries not available. Cannot start consumer.")
+            self.offline_mode = True
+            return
+        
+        # Start Kafka consumer in a separate thread
+        consumer_thread = threading.Thread(target=self._consume_kafka_data)
+        consumer_thread.daemon = True  # Thread will exit when main program exits
+        consumer_thread.start()
+        logger.info("Kafka consumer thread started")
+    
+    def _consume_kafka_data(self):
+        """Consume data from Kafka and add it to the streaming buffer."""
+        if not KAFKA_AVAILABLE:
+            logger.error("Kafka libraries not available. Cannot consume data.")
+            return
+            
+        try:
+            # Configure the Kafka consumer
+            consumer_conf = {
+                'bootstrap.servers': self.kafka_bootstrap_servers,
+                'group.id': 'agro_analyzer_group',
+                'auto.offset.reset': 'latest',
+                'session.timeout.ms': 6000
+            }
+            
+            consumer = Consumer(consumer_conf)
+            consumer.subscribe([self.kafka_topic])
+            
+            logger.info(f"Kafka consumer connected and subscribed to {self.kafka_topic}")
+            
+            while True:
+                # Poll for messages
+                msg = consumer.poll(1.0)
+                
+                if msg is None:
+                    continue
+                
+                if msg.error():
+                    logger.error(f"Consumer error: {msg.error()}")
+                    continue
+                
+                try:
+                    # Process the message
+                    data = json.loads(msg.value().decode('utf-8'))
+                    
+                    # Convert to DataFrame row
+                    df_row = pd.DataFrame([data])
+                    
+                    # Add to buffer with thread safety
+                    with self.data_lock:
+                        self.streaming_data_buffer.append(df_row)
+                        
+                        # If buffer gets large enough, update the model
+                        if len(self.streaming_data_buffer) >= 100:  # Arbitrary threshold
+                            self._process_streaming_buffer()
+                    
+                except Exception as e:
+                    logger.error(f"Error processing Kafka message: {e}")
+        
+        except Exception as e:
+            logger.error(f"Kafka consumer error: {e}")
+        
+        finally:
+            # Close down consumer to commit final offsets
+            try:
+                consumer.close()
+            except:
+                pass
+    
+    def _process_streaming_buffer(self):
+        """Process the accumulated streaming data and update the model if needed."""
+        with self.data_lock:
+            if not self.streaming_data_buffer:
+                return
+            
+            # Concatenate all buffered data
+            buffer_df = pd.concat(self.streaming_data_buffer, ignore_index=True)
+            
+            # Clear the buffer
+            self.streaming_data_buffer = []
+            
+            # Update historical data
+            if self.historical_data is not None:
+                self.historical_data = pd.concat([self.historical_data, buffer_df], ignore_index=True)
+            else:
+                self.historical_data = buffer_df
+            
+            # Save the updated dataset
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            self.historical_data.to_csv(os.path.join(self.data_path, f'updated_dataset_{timestamp}.csv'), index=False)
+            
+            # Retrain model if we have enough data and either:
+            # 1. The model hasn't been trained yet, or
+            # 2. We have accumulated a significant amount of new data
+            if (len(self.historical_data) > self.sequence_length + 100 and 
+                (not self.is_model_trained or len(buffer_df) > 500)):
+                logger.info("Retraining model with updated data...")
+                self.train_model()
+    
+    def predict(self, input_data):
+        """
+        Make predictions using the trained model.
+        
+        Args:
+            input_data: DataFrame with the same features as training data
+            
+        Returns:
+            Predicted values
+        """
+        if not self.is_model_trained or self.model is None:
+            logger.error("Model not trained yet. Cannot make predictions.")
+            return None
+        
+        try:
+            # Preprocess input data
+            numeric_data = input_data.select_dtypes(include=[np.number])
+            scaled_data = self.scaler.transform(numeric_data)
+            
+            # Create sequences
+            X = []
+            for i in range(len(scaled_data) - self.sequence_length + 1):
+                X.append(scaled_data[i:i+self.sequence_length])
+            
+            X = np.array(X)
+            
+            # Make predictions
+            predictions = self.model.predict(X)
+            
+            # Inverse transform to get original scale
+            # We need to create a dummy array with the same shape as our original data
+            dummy = np.zeros((len(predictions), numeric_data.shape[1]))
+            # Put predictions in the target column position
+            target_idx = list(numeric_data.columns).index('yield')
+            dummy[:, target_idx] = predictions.flatten()
+            
+            # Inverse transform
+            unscaled_predictions = self.scaler.inverse_transform(dummy)[:, target_idx]
+            
+            return unscaled_predictions
+        
+        except Exception as e:
+            logger.error(f"Error making predictions: {e}")
+            return None
+
+    def run(self):
+        """Main method to run the analyzer."""
+        # Train initial model if historical data is available
+        if self.historical_data is not None and len(self.historical_data) > self.sequence_length + 1:
+            logger.info("Training initial model with historical data...")
+            self.train_model()
+        
+        # Start consuming from Kafka if not in offline mode
+        if not self.offline_mode:
+            self.start_kafka_consumer()
+        
+        # Keep the main thread running
+        try:
+            while True:
+                # In offline mode, simulate new data periodically
+                if self.offline_mode and self.is_model_trained:
+                    logger.info("Running in offline mode. Simulating new data...")
+                    self._simulate_new_data()
+                
+                time.sleep(60)  # Check every minute if we need to do anything
+                
+                # Periodically save the model and data
+                if self.is_model_trained:
+                    timestamp = time.strftime("%Y%m%d_%H%M%S")
+                    self.model.save(self.get_model_filepath(f'model_checkpoint_{timestamp}'))
+                    logger.info(f"Saved model checkpoint at {timestamp}")
+        
+        except KeyboardInterrupt:
+            logger.info("Shutting down gracefully...")
+        
+        finally:
+            # Save final model and data before exiting
+            if self.is_model_trained and self.model is not None:
+                self.model.save(self.get_model_filepath('final_model'))
+                logger.info("Final model saved")
+            
+            if self.historical_data is not None:
+                self.historical_data.to_csv(os.path.join(self.data_path, 'final_dataset.csv'), index=False)
+                logger.info("Final dataset saved")
+    
+    def _simulate_new_data(self):
+        """In offline mode, simulate new data points to test model updating."""
+        # Create a few new synthetic data points
+        new_data = []
+        current_time = pd.Timestamp.now()
+        
+        for i in range(10):  # Generate 10 new points
+            timestamp = current_time + pd.Timedelta(hours=i)
+            day_of_year = timestamp.dayofyear
+            hour_of_day = timestamp.hour
+            season_factor = np.sin(2 * np.pi * day_of_year / 365)
+            daily_factor = np.sin(2 * np.pi * hour_of_day / 24)
+            
+            # Generate sensor readings with patterns
+            temperature = 25 + 10 * season_factor + 5 * daily_factor + np.random.normal(0, 2)
+            humidity = 60 + 20 * season_factor - 10 * daily_factor + np.random.normal(0, 5)
+            rainfall = max(0, 5 * season_factor - 2 * daily_factor + np.random.exponential(1))
+            soil_moisture = 30 + 15 * season_factor + np.random.normal(0, 3)
+            solar_radiation = max(0, 800 + 400 * season_factor + 300 * daily_factor + np.random.normal(0, 50))
+            wind_speed = 5 + 2 * season_factor + 3 * daily_factor + np.random.exponential(2)
+            
+            # Calculate synthetic yield
+            base_yield = 100
+            temp_effect = -0.5 * (temperature - 25)**2 / 100
+            moisture_effect = -0.5 * (soil_moisture - 35)**2 / 100
+            rain_effect = 0.1 * rainfall if rainfall < 10 else (1 - 0.02 * (rainfall - 10))
+            
+            yield_estimate = base_yield * (1 + temp_effect + moisture_effect + rain_effect) / 3
+            
+            # Create data point
+            data = {
+                'timestamp': timestamp,
+                'temperature': temperature,
+                'humidity': humidity,
+                'rainfall': rainfall,
+                'soil_moisture': soil_moisture,
+                'solar_radiation': solar_radiation,
+                'wind_speed': wind_speed,
+                'yield': yield_estimate
+            }
+            
+            new_data.append(data)
+        
+        # Convert to DataFrame
+        new_df = pd.DataFrame(new_data)
+        
+        # Add to buffer with thread safety
+        with self.data_lock:
+            self.streaming_data_buffer.append(new_df)
+            self._process_streaming_buffer()
+        
+        logger.info(f"Added {len(new_data)} simulated data points in offline mode")
+
+
+class DataSimulator:
+    """
+    Simulates IoT sensor data and sends it to Kafka for testing purposes.
+    This is useful for development when real IoT sensors are not available.
+    """
+    def __init__(self, kafka_bootstrap_servers='localhost:9092', kafka_topic='agro_iot_sensors', 
+                 offline_mode=not KAFKA_AVAILABLE):
+        """
+        Initialize the data simulator.
+        
+        Args:
+            kafka_bootstrap_servers: Kafka server address
+            kafka_topic: Topic to produce IoT sensor data to
+            offline_mode: If True, save data to CSV instead of sending to Kafka
+        """
+        self.kafka_bootstrap_servers = kafka_bootstrap_servers
+        self.kafka_topic = kafka_topic
+        self.offline_mode = offline_mode
+        self.data_path = 'E:\\Agrospere\\models\\datas\\RNN_realtime data'
+        
+        # Ensure data directory exists
+        os.makedirs(self.data_path, exist_ok=True)
+        
+        # Initialize Kafka producer if not in offline mode
+        self.producer = None
+        if not self.offline_mode and KAFKA_AVAILABLE:
+            try:
+                producer_conf = {
+                    'bootstrap.servers': kafka_bootstrap_servers,
+                    'message.timeout.ms': 10000
+                }
+                self.producer = Producer(producer_conf)
+                logger.info(f"Kafka producer initialized for {kafka_bootstrap_servers}")
+            except Exception as e:
+                logger.error(f"Failed to initialize Kafka producer: {e}")
+                logger.info("Switching to offline mode")
+                self.offline_mode = True
+    
+    def generate_sample_data(self):
+        """Generate a single sample of simulated sensor data."""
+        # Current timestamp
+        timestamp = pd.Timestamp.now().isoformat()
+        
+        # Simulate seasonal patterns
+        day_of_year = pd.Timestamp.now().dayofyear
+        hour_of_day = pd.Timestamp.now().hour
+        season_factor = np.sin(2 * np.pi * day_of_year / 365)
+        daily_factor = np.sin(2 * np.pi * hour_of_day / 24)
+        
+        # Generate sensor readings with some randomness and seasonal effects
+        temperature = 25 + 10 * season_factor + 5 * daily_factor + np.random.normal(0, 2)  # °C
+        humidity = 60 + 20 * season_factor - 10 * daily_factor + np.random.normal(0, 5)     # %
+        rainfall = max(0, 5 * season_factor - 2 * daily_factor + np.random.exponential(1)) # mm
+        soil_moisture = 30 + 15 * season_factor + np.random.normal(0, 3) # %
+        solar_radiation = max(0, 800 + 400 * season_factor + 300 * daily_factor + np.random.normal(0, 50)) # W/m²
+        wind_speed = 5 + 2 * season_factor + 3 * daily_factor + np.random.exponential(2)  # m/s
+        
+        # Calculate a simulated yield estimate based on the above factors
+        # This is a simplified model for demonstration
+        base_yield = 100  # base yield in arbitrary units
+        temp_effect = -0.5 * (temperature - 25)**2 / 100  # optimal temp around 25°C
+        moisture_effect = -0.5 * (soil_moisture - 35)**2 / 100  # optimal moisture around 35%
+        rain_effect = 0.1 * rainfall if rainfall < 10 else (1 - 0.02 * (rainfall - 10))
+        
+        # Combine effects (simplified)
+        yield_estimate = base_yield * (1 + temp_effect + moisture_effect + rain_effect) / 3
+        
+        # Create data point
+        data = {
+            'timestamp': timestamp,
+            'temperature': temperature,
+            'humidity': humidity,
+            'rainfall': rainfall,
+            'soil_moisture': soil_moisture,
+            'solar_radiation': solar_radiation,
+            'wind_speed': wind_speed,
+            'yield': yield_estimate
+        }
+        
+        return data
+    
+    def delivery_report(self, err, msg):
+        """Callback for message delivery reports."""
+        if err is not None:
+            logger.error(f'Message delivery failed: {err}')
+        else:
+            logger.debug(f'Message delivered to {msg.topic()} [{msg.partition()}]')
+    
+    def run_simulation(self, interval_seconds=5.0, duration_minutes=None):
+        """
+        Run the data simulation, sending data to Kafka or saving to CSV.
+        
+        Args:
+            interval_seconds: Time interval between data points
+            duration_minutes: How long to run the simulation (None = indefinitely)
+        """
+        if self.offline_mode:
+            logger.info(f"Starting data simulation in offline mode. Saving to {self.data_path}")
+        else:
+            logger.info(f"Starting data simulation. Sending to Kafka topic {self.kafka_topic}")
+        
+        start_time = time.time()
+        count = 0
+        simulated_data = []  # For offline mode
+        
+        try:
+            while True:
+                # Generate a data point
+                data = self.generate_sample_data()
+                count += 1
+                
+                # In offline mode, collect data for CSV
+                if self.offline_mode:
+                    simulated_data.append(data)
+                # In Kafka mode, send to topic
+                elif KAFKA_AVAILABLE and self.producer:
+                    try:
+                        # Convert data to JSON and send
+                        json_data = json.dumps(data).encode('utf-8')
+                        self.producer.produce(self.kafka_topic, json_data)
+                        self.producer.poll(0)  # Trigger any callbacks
+                    except Exception as e:
+                        logger.error(f"Error sending to Kafka: {e}")
+                
+                # Log progress periodically
+                if count % 20 == 0:
+                    if self.offline_mode:
+                        logger.info(f"Generated {count} simulated data points (offline mode)")
+                    else:
+                        logger.info(f"Sent {count} simulated data points to Kafka")
+                    
+                    # In offline mode, periodically save data to CSV
+                    if self.offline_mode and len(simulated_data) >= 100:
+                        df = pd.DataFrame(simulated_data)
+                        timestamp = time.strftime("%Y%m%d_%H%M%S")
+                        csv_path = os.path.join(self.data_path, f'simulated_data_{timestamp}.csv')
+                        df.to_csv(csv_path, index=False)
+                        logger.info(f"Saved {len(simulated_data)} data points to {csv_path}")
+                        simulated_data = []  # Clear after saving
+                
+                # Check if we've reached the duration limit
+                if duration_minutes is not None:
+                    elapsed_minutes = (time.time() - start_time) / 60
+                    if elapsed_minutes >= duration_minutes:
+                        logger.info(f"Simulation completed after {duration_minutes} minutes")
+                        break
+                
+                # Wait for the next interval
+                time.sleep(interval_seconds)
+        
+        except KeyboardInterrupt:
+            logger.info("Simulation stopped by user")
+        
+        finally:
+            # Save any remaining data in offline mode
+            if self.offline_mode and simulated_data:
+                df = pd.DataFrame(simulated_data)
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                csv_path = os.path.join(self.data_path, f'simulated_data_{timestamp}.csv')
+                df.to_csv(csv_path, index=False)
+                logger.info(f"Saved final {len(simulated_data)} data points to {csv_path}")
+            
+            # Flush any remaining messages in Kafka mode
+            if not self.offline_mode and KAFKA_AVAILABLE and self.producer:
+                try:
+                    self.producer.flush(timeout=5)
+                except:
+                    pass
+                
+            logger.info(f"Simulation ended. Generated {count} data points.")
+
+
+def main():
+    """Main function to run the RNN model training on real-time data."""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Real-time data analyzer with RNN model for agricultural data')
+    parser.add_argument('--kafka-server', type=str, default='localhost:9092', help='Kafka bootstrap server')
+    parser.add_argument('--kafka-topic', type=str, default='agro_iot_sensors', help='Kafka topic for IoT sensor data')
+    parser.add_argument('--data-path', type=str, default='E:\\Agrospere\\models\\datas\\RNN_realtime data', 
+                        help='Path to historical data')
+    parser.add_argument('--model-path', type=str, default='E:\\Agrospere\\models\\saved_models', 
+                        help='Path to save trained models')
+    parser.add_argument('--simulate', action='store_true', help='Run data simulator instead of analyzer')
+    parser.add_argument('--sim-interval', type=float, default=5.0, help='Simulation interval in seconds')
+    parser.add_argument('--sim-duration', type=float, default=None, help='Simulation duration in minutes')
+    parser.add_argument('--offline', action='store_true', help='Run in offline mode (no Kafka)')
+    
+    args = parser.parse_args()
+    
+    # Check if Kafka is available and warn if not
+    if not KAFKA_AVAILABLE and not args.offline:
+        logger.warning("confluent_kafka package not available. Forcing offline mode.")
+        offline_mode = True
+    else:
+        offline_mode = args.offline
+    
+    if args.simulate:
+        # Run the data simulator
+        simulator = DataSimulator(
+            kafka_bootstrap_servers=args.kafka_server,
+            kafka_topic=args.kafka_topic,
+            offline_mode=offline_mode
+        )
+        simulator.run_simulation(
+            interval_seconds=args.sim_interval,
+            duration_minutes=args.sim_duration
+        )
+    else:
+        # Run the data analyzer
+        analyzer = RealtimeDataAnalyzer(
+            kafka_bootstrap_servers=args.kafka_server,
+            kafka_topic=args.kafka_topic,
+            data_path=args.data_path,
+            model_save_path=args.model_path,
+            offline_mode=offline_mode
+        )
+        analyzer.run()
+
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
